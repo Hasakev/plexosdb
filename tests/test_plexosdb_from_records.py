@@ -189,6 +189,92 @@ def test_bulk_insert_memberships_from_records(db_base: PlexosDB):
         _ = db.add_memberships_from_records(memberships)
 
 
+def test_bulk_insert_memberships_from_records_respects_chunksize(
+    db_instance_with_schema: PlexosDB,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from plexosdb import ClassEnum, CollectionEnum
+
+    db = db_instance_with_schema
+    parent_names = [f"ChunkGen_{idx}" for idx in range(5)]
+    child_names = [f"ChunkNode_{idx}" for idx in range(5)]
+
+    db.add_objects(ClassEnum.Generator, *parent_names)
+    db.add_objects(ClassEnum.Node, *child_names)
+
+    parent_object_ids = db.get_objects_id(parent_names, class_enum=ClassEnum.Generator)
+    child_object_ids = db.get_objects_id(child_names, class_enum=ClassEnum.Node)
+    parent_class_id = db.get_class_id(ClassEnum.Generator)
+    child_class_id = db.get_class_id(ClassEnum.Node)
+    collection_id = db.get_collection_id(
+        CollectionEnum.Nodes,
+        parent_class_enum=ClassEnum.Generator,
+        child_class_enum=ClassEnum.Node,
+    )
+    memberships = [
+        {
+            "collection_id": collection_id,
+            "parent_class_id": parent_class_id,
+            "child_class_id": child_class_id,
+            "child_object_id": child_id,
+            "parent_object_id": parent_id,
+        }
+        for parent_id, child_id in zip(parent_object_ids, child_object_ids)
+    ]
+
+    observed_batch_sizes: list[int] = []
+    original_executemany = db._db.executemany
+
+    def spy_executemany(query, params_seq):
+        observed_batch_sizes.append(len(params_seq))
+        return original_executemany(query, params_seq)
+
+    monkeypatch.setattr(db._db, "executemany", spy_executemany)
+    db.add_memberships_from_records(memberships, chunksize=2)
+
+    assert observed_batch_sizes == [2, 2, 1]
+
+
+def test_bulk_insert_memberships_from_records_rejects_non_positive_chunksize(
+    db_instance_with_schema: PlexosDB,
+):
+    db = db_instance_with_schema
+    membership = {
+        "parent_class_id": 2,
+        "parent_object_id": 1,
+        "collection_id": 3,
+        "child_class_id": 3,
+        "child_object_id": 1,
+    }
+
+    with pytest.raises(ValueError, match="chunksize must be >= 1"):
+        db.add_memberships_from_records([membership], chunksize=0)
+
+
+def test_bulk_insert_memberships_from_records_accepts_empty_records(
+    db_instance_with_schema: PlexosDB,
+):
+    db = db_instance_with_schema
+
+    assert db.add_memberships_from_records([]) is True
+
+
+def test_bulk_insert_memberships_from_records_invalid_keys_shape(
+    db_instance_with_schema: PlexosDB,
+):
+    db = db_instance_with_schema
+    invalid_membership = {
+        "parent_class_id": 2,
+        "parent_object_id": 1,
+        "collection_id": 3,
+        "child_class_id": 3,
+        "bad_key": 1,
+    }
+
+    with pytest.raises(KeyError, match="Some of the records do not have all the required fields"):
+        db.add_memberships_from_records([invalid_membership])
+
+
 def test_add_properties_from_records_no_records(db_instance_with_schema: PlexosDB, caplog):
     """Gracefully handle empty payload."""
     from plexosdb import ClassEnum, CollectionEnum
@@ -272,3 +358,20 @@ def test_add_properties_from_records_non_system_parent(db_with_topology: PlexosD
 
     data_count = db._db.fetchone("SELECT COUNT(*) FROM t_data")[0]
     assert data_count == 1
+
+
+def test_get_memberships_system_chunks_over_900_names(db_base: PlexosDB):
+    """get_memberships_system passes a tuple (not list) to fetchall_dict when >900 names.
+
+    Regression test: the params were previously built as a list[Any], which is incompatible
+    with SQLiteManager.fetchall_dict's expected tuple[Any, ...] parameter type.
+    """
+    from plexosdb import ClassEnum
+
+    db = db_base
+    names = [f"ChunkGen_{i}" for i in range(950)]
+    db.add_objects(ClassEnum.Generator, names)
+
+    result = db.get_memberships_system(names, object_class=ClassEnum.Generator)
+    assert len(result) == 950
+    assert {r["name"] for r in result} == set(names)

@@ -13,7 +13,6 @@ import warnings
 
 from loguru import logger
 
-from .checks import check_memberships_from_records
 from .db_manager import SQLiteManager
 from .enums import (
     ClassEnum,
@@ -31,6 +30,7 @@ from .exceptions import (
 )
 from .utils import (
     apply_scenario_tags,
+    batched,
     create_membership_record,
     get_system_object_name,
     insert_property_texts,
@@ -549,7 +549,6 @@ class PlexosDB:
         See Also
         --------
         add_membership : Add a single membership between two objects
-        check_memberships_from_records : Validate membership records format
         create_membership_record : Helper to create membership record dictionaries
 
         Examples
@@ -585,18 +584,54 @@ class PlexosDB:
         >>> db.add_memberships_from_records(records)
         True
         """
-        if not check_memberships_from_records(records):
-            msg = "Some of the records do not have all the required fields. "
-            msg += "Check construction of records."
-            raise KeyError(msg)
+        if not records:
+            logger.debug("No membership records provided")
+            return True
+
+        if chunksize < 1:
+            msg = f"chunksize must be >= 1, received {chunksize}"
+            raise ValueError(msg)
+
         query = f"""
         INSERT INTO {Schema.Memberships.name}
             (parent_class_id,parent_object_id, collection_id, child_class_id, child_object_id)
         VALUES
-            (:parent_class_id, :parent_object_id, :collection_id, :child_class_id, :child_object_id)
+            (?, ?, ?, ?, ?)
         """
-        query_status = self._db.executemany(query, records)
-        assert query_status
+        error_msg = "Some of the records do not have all the required fields. Check construction of records."
+
+        def prepare_batch(
+            batch_records: Sequence[dict[str, int]],
+        ) -> list[tuple[int, int, int, int, int]]:
+            """Validate records and map each membership dict to positional SQL parameters."""
+            params: list[tuple[int, int, int, int, int]] = []
+            for record in batch_records:
+                # Keep strict validation semantics: exact keys, no missing or extra fields.
+                if len(record) != 5:
+                    raise KeyError(error_msg)
+                try:
+                    params.append(
+                        (
+                            record["parent_class_id"],
+                            record["parent_object_id"],
+                            record["collection_id"],
+                            record["child_class_id"],
+                            record["child_object_id"],
+                        )
+                    )
+                except KeyError as exc:
+                    raise KeyError(error_msg) from exc
+            return params
+
+        with self._db.transaction():
+            if chunksize >= len(records):
+                query_status = self._db.executemany(query, prepare_batch(records))
+                assert query_status
+            else:
+                for batch in batched(records, chunksize):
+                    query_status = self._db.executemany(query, prepare_batch(batch))
+                    assert query_status
+
         logger.debug("Added {} memberships.", len(records))
         return True
 
@@ -898,7 +933,7 @@ class PlexosDB:
 
         with self._db.transaction():
             data_id_map = insert_property_values(self, params, metadata_map=metadata_map)
-            apply_scenario_tags(self, params, scenario=scenario, chunksize=chunksize)
+            apply_scenario_tags(self, params, scenario=scenario, chunksize=chunksize, data_id_map=data_id_map)
 
             if has_datafile_text:
                 insert_property_texts(
@@ -2702,10 +2737,9 @@ class PlexosDB:
         self,
         *object_names: Iterable[str] | str,
         object_class: ClassEnum,
-        category: str | None = None,
         collection: CollectionEnum | None = None,
     ) -> list[dict[str, Any]]:
-        """Retrieve system memberships for the given object(s).
+        """Retrieve memberships for the requested object names.
 
         Parameters
         ----------
@@ -2715,21 +2749,23 @@ class PlexosDB:
         object_class : ClassEnum
             Class of the objects.
         collection : CollectionEnum | None, optional
-            Collection to filter memberships.
+            Collection used to filter memberships. When provided, results are
+            limited to memberships under the System parent class for that
+            collection.
 
         Returns
         -------
-        list[tuple]
-            A list of tuples representing memberships of the object to the system.
-
-        Raises
-        ------
-        KeyError
-            If any of the object_names do not exist.
+        list[dict[str, Any]]
+            Membership rows for the requested object names in ``object_class``.
+            Names that do not exist are ignored.
         """
         names = normalize_names(*object_names)
-        object_ids = tuple(self.get_object_id(object_class, name=name, category=category) for name in names)
-        query_string = """
+        if not names:
+            return []
+
+        class_id = self.get_class_id(object_class)  # 1 query instead of N
+
+        base_query = """
             SELECT
                 mem.membership_id,
                 mem.child_class_id,
@@ -2737,36 +2773,36 @@ class PlexosDB:
                 mem.collection_id,
                 child_class.name AS class,
                 collections.name AS collection_name
-            FROM
-                t_membership AS mem
-            INNER JOIN
-                t_object AS parent_object ON mem.parent_object_id = parent_object.object_id
-            INNER JOIN
-                t_object AS child_object ON mem.child_object_id = child_object.object_id
-            LEFT JOIN
-                t_class AS parent_class ON mem.parent_class_id = parent_class.class_id
-            LEFT JOIN
-                t_class AS child_class ON mem.child_class_id = child_class.class_id
-            LEFT JOIN
-                t_collection AS collections ON mem.collection_id = collections.collection_id
-            """
-        conditions = []
-        if len(object_ids) == 1:
-            conditions.append(
-                f"(child_object.object_id = {object_ids[0]} OR parent_object.object_id = {object_ids[0]})"
-            )
-        else:
-            conditions.append(
-                f"(child_object.object_id in {object_ids} OR parent_object.object_id in {object_ids})"
-            )
-        parent_class = ClassEnum.System
+            FROM t_membership AS mem
+            INNER JOIN t_object AS parent_object ON mem.parent_object_id = parent_object.object_id
+            INNER JOIN t_object AS child_object ON mem.child_object_id = child_object.object_id
+            LEFT JOIN t_class AS parent_class ON mem.parent_class_id = parent_class.class_id
+            LEFT JOIN t_class AS child_class ON mem.child_class_id = child_class.class_id
+            LEFT JOIN t_collection AS collections ON mem.collection_id = collections.collection_id
+            WHERE mem.child_class_id = ?
+            AND child_object.name IN ({ph})
+        """
+
+        extra = ""
+        extra_params: list[Any] = []
         if collection:
-            conditions.append(
-                f"parent_class.name = '{parent_class.value}' and collections.name = '{collection.value}'"
+            extra = " AND parent_class.name = ? AND collections.name = ?"
+            extra_params = [ClassEnum.System.value, collection.value]
+
+        # Specify bound parameter limit
+        CHUNK = 900  # noqa: N806
+        all_rows: list[dict[str, Any]] = []
+        for i in range(0, len(names), CHUNK):
+            chunk = names[i : i + CHUNK]
+            ph = ",".join("?" * len(chunk))
+            params = (class_id, *chunk, *extra_params)
+            all_rows.extend(
+                self._db.fetchall_dict(
+                    base_query.format(ph=ph) + extra,
+                    params,
+                )
             )
-        if conditions:
-            query_string += " WHERE " + " AND ".join(conditions)
-        return self._db.fetchall_dict(query_string)
+        return all_rows
 
     def get_metadata(
         self,
